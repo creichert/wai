@@ -25,6 +25,7 @@ import Network.Wai.Handler.Warp.Buffer
 import Network.Wai.Handler.Warp.Counter
 import qualified Network.Wai.Handler.Warp.Date as D
 import qualified Network.Wai.Handler.Warp.FdCache as F
+import Network.Wai.Handler.Warp.HTTP2
 import Network.Wai.Handler.Warp.Header
 import Network.Wai.Handler.Warp.ReadInt
 import Network.Wai.Handler.Warp.Recv
@@ -124,7 +125,7 @@ runSettingsConnectionMaker :: Settings -> IO (IO Connection, SockAddr) -> Applic
 runSettingsConnectionMaker x y =
     runSettingsConnectionMakerSecure x (go y)
   where
-    go = fmap (first (fmap (, False)))
+    go = fmap (first (fmap (, TCP)))
 
 ----------------------------------------------------------------
 
@@ -132,7 +133,7 @@ runSettingsConnectionMaker x y =
 -- which will return 'Connection'.
 --
 -- Since 2.1.4
-runSettingsConnectionMakerSecure :: Settings -> IO (IO (Connection, Bool), SockAddr) -> Application -> IO ()
+runSettingsConnectionMakerSecure :: Settings -> IO (IO (Connection, Transport), SockAddr) -> Application -> IO ()
 runSettingsConnectionMakerSecure set getConnMaker app = do
     settingsBeforeMainLoop set
     counter <- newCounter
@@ -169,7 +170,7 @@ onE set mreq e = case fromException e of
 --
 -- Our approach is explained in the comments below.
 acceptConnection :: Settings
-                 -> IO (IO (Connection, Bool), SockAddr)
+                 -> IO (IO (Connection, Transport), SockAddr)
                  -> Application
                  -> D.DateCache
                  -> Maybe F.MutableFdCache
@@ -220,7 +221,7 @@ acceptConnection set getConnMaker app dc fc tm counter = do
 -- Fork a new worker thread for this connection maker, and ask for a
 -- function to unmask (i.e., allow async exceptions to be thrown).
 fork :: Settings
-     -> IO (Connection, Bool)
+     -> IO (Connection, Transport)
      -> SockAddr
      -> Application
      -> D.DateCache
@@ -239,7 +240,7 @@ fork set mkConn addr app dc fc tm counter = settingsFork set $ \ unmask ->
     -- We grab the connection before registering timeouts since the
     -- timeouts will be useless during connection creation, due to the
     -- fact that async exceptions are still masked.
-    bracket mkConn closeConn $ \(conn0, isSecure') ->
+    bracket mkConn closeConn $ \(conn0, transport) ->
 
     -- We need to register a timeout handler for this thread, and
     -- cancel that handler as soon as we exit.
@@ -260,9 +261,9 @@ fork set mkConn addr app dc fc tm counter = settingsFork set $ \ unmask ->
 
        -- Actually serve this connection.
        -- bracket with closeConn above ensures the connection is closed.
-       when goingon $ serveConnection conn ii addr isSecure' set app
+       when goingon $ serveConnection conn ii addr transport set app
   where
-    closeConn (conn, _isSecure) = connClose conn
+    closeConn (conn, _transport) = connClose conn
 
     onOpen adr    = increase counter >> settingsOnOpen  set adr
     onClose adr _ = decrease counter >> settingsOnClose set adr
@@ -270,18 +271,20 @@ fork set mkConn addr app dc fc tm counter = settingsFork set $ \ unmask ->
 serveConnection :: Connection
                 -> InternalInfo
                 -> SockAddr
-                -> Bool -- ^ is secure?
+                -> Transport
                 -> Settings
                 -> Application
                 -> IO ()
-serveConnection conn ii origAddr isSecure' settings app = do
+serveConnection conn ii origAddr transport settings app = do
     istatus <- newIORef False
     src <- mkSource (connSource conn th istatus)
     addr <- getProxyProtocolAddr src
-    recvSendLoop addr istatus src `E.catch` \e -> do
-        sendErrorResponse addr istatus e
-        throwIO (e :: SomeException)
-
+    if isHTTP2 transport then
+        http2 conn ii addr transport settings src app
+      else do
+        http1 addr istatus src `E.catch` \e -> do
+            sendErrorResponse addr istatus e
+            throwIO (e :: SomeException)
   where
     getProxyProtocolAddr src =
         case settingsProxyProtocol settings of
@@ -336,19 +339,19 @@ serveConnection conn ii origAddr isSecure' settings app = do
 
     errorResponse e = settingsOnExceptionResponse settings e
 
-    recvSendLoop addr istatus fromClient = do
-        (req', mremainingRef, idxhdr) <- recvRequest settings conn ii addr fromClient
-        let req = req' { isSecure = isSecure' }
-        keepAlive <- processRequest istatus fromClient req mremainingRef idxhdr
+    http1 addr istatus src = do
+        (req', mremainingRef, idxhdr) <- recvRequest settings conn ii addr src
+        let req = req' { isSecure = isTransportSecure transport }
+        keepAlive <- processRequest istatus src req mremainingRef idxhdr
             `E.catch` \e -> do
                 -- Call the user-supplied exception handlers, passing the request.
                 sendErrorResponse addr istatus e
                 onE settings (Just req) e
                 -- Don't throw the error again to prevent calling onE twice.
                 return False
-        when keepAlive $ recvSendLoop addr istatus fromClient
+        when keepAlive $ http1 addr istatus src
 
-    processRequest istatus fromClient req mremainingRef idxhdr = do
+    processRequest istatus src req mremainingRef idxhdr = do
         -- Let the application run for as long as it wants
         T.pause th
 
@@ -364,7 +367,7 @@ serveConnection conn ii origAddr isSecure' settings app = do
             writeIORef istatus False
             keepAlive <- sendResponse
                 (settingsServerName settings)
-                conn ii req idxhdr (readSource fromClient) res
+                conn ii req idxhdr (readSource src) res
             writeIORef keepAliveRef keepAlive
             return ResponseReceived
         keepAlive <- readIORef keepAliveRef
