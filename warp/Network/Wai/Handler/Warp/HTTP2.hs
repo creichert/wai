@@ -179,9 +179,7 @@ switch Context{..} Frame{ framePayload = SettingsFrame alist,
                           frameHeader = FrameHeader{..} } = do
     putStrLn "SettingsFrame"
     print alist
-    if alist == [] then
-        when (testAck flags) $ return () -- fixme: clearing timeout
-      else do
+    unless (testAck flags) $ do
         modifyIORef http2settings $ \old -> updateSettings old alist
         let rsp = RspFrame $ settingsFrame setAck []
         atomically $ writeTQueue outputQ rsp
