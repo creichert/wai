@@ -128,7 +128,7 @@ inadequateSecurity conn = goaway conn InadequateSecurity "Weak TLS"
 
 ----------------------------------------------------------------
 
-data Next = None | Done | Fork ReqQueue Int
+data Next = None | Done | CErr ErrorCodeId | Fork ReqQueue Int
 
 frameReader :: Connection -> Context -> MkReq -> EnqRsp -> Source -> Application -> IO ()
 frameReader conn ctx mkreq enqout src app = loop
@@ -137,7 +137,7 @@ frameReader conn ctx mkreq enqout src app = loop
         bs <- readSource src
         unless (BS.null bs) $ do
             case decodeFrame defaultSettings bs of -- fixme
-                Left err          -> goaway conn err ""
+                Left err          -> goaway conn err "" -- fixme
                 Right (frame,bs') -> do
                     leftoverSource src bs'
                     print $ frameHeader frame
@@ -145,6 +145,7 @@ frameReader conn ctx mkreq enqout src app = loop
                     case x of
                         Done -> return ()
                         None -> loop
+                        CErr err -> goaway conn err "" -- fixme
                         Fork inpQ stid -> do
                             void . forkIO $ reqReader mkreq enqout inpQ stid app
                             -- fixme: T.registerKillThread or pooling?
@@ -226,7 +227,13 @@ switch Context{..} (GoAwayFrame _ _ _)    = undefined
 -- Not supported yet
 switch Context{..} (PriorityFrame _)      = undefined
 switch Context{..} (WindowUpdateFrame _)  = undefined
-switch Context{..} (PushPromiseFrame _ _) = undefined
+-}
+
+switch Context{..} Frame{ framePayload = PushPromiseFrame _ _,
+                          frameHeader = _}
+                          = return $ CErr ProtocolError
+
+{-
 switch Context{..} (UnknownFrame _ _)     = undefined
 switch Context{..} (ContinuationFrame _)  = undefined
 -}
