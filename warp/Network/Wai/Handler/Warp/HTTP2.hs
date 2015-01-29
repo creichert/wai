@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 module Network.Wai.Handler.Warp.HTTP2 (isHTTP2, http2) where
 
@@ -29,6 +30,7 @@ import qualified Data.IntMap as M
 import qualified Network.HTTP.Types as H
 import qualified Network.Wai.Handler.Warp.Settings as S (Settings, settingsNoParsePath, settingsServerName)
 import qualified Network.Wai.Handler.Warp.Timeout as T
+import Data.Typeable
 
 import Network.HTTP2
 import Network.HPACK
@@ -131,26 +133,36 @@ inadequateSecurity conn = goaway conn InadequateSecurity "Weak TLS"
 
 data Next = None | Done | CErr ErrorCodeId | Fork ReqQueue Int
 
+data Break = Break ErrorCodeId ByteString deriving (Show, Typeable)
+
+instance E.Exception Break
+
 frameReader :: Connection -> Context -> MkReq -> EnqRsp -> Source -> Application -> IO ()
-frameReader conn ctx mkreq enqout src app = loop
+frameReader conn ctx mkreq enqout src app = E.handle hanlder loop
   where
+    hanlder (Break err debugmsg) = goaway conn err debugmsg
     loop = do
         bs <- readSource src
         unless (BS.null bs) $ do
-            case decodeFrame defaultSettings bs of -- fixme
-                Left err          -> goaway conn err "" -- fixme
-                Right (frame,bs') -> do
-                    leftoverSource src bs'
-                    print $ frameHeader frame
-                    x <- switch ctx frame
-                    case x of
-                        Done -> return ()
-                        None -> loop
-                        CErr err -> goaway conn err "" -- fixme
-                        Fork inpQ stid -> do
-                            void . forkIO $ reqReader mkreq enqout inpQ stid app
-                            -- fixme: T.registerKillThread or pooling?
-                            loop
+            let eframe = decodeFrame defaultSettings bs
+            checkFrame eframe
+            let Right (frame,bs') = eframe
+            leftoverSource src bs'
+            checkStreamId $ streamId $ frameHeader frame
+            x <- switch ctx frame
+            case x of
+                Done -> return ()
+                None -> loop
+                CErr err -> goaway conn err "" -- fixme
+                Fork inpQ stid -> do
+                    void . forkIO $ reqReader mkreq enqout inpQ stid app
+                    -- fixme: T.registerKillThread or pooling?
+                    loop
+    checkFrame (Left err) = E.throwIO $ Break err "Cannot decode the frame"
+    checkFrame _          = return ()
+    checkStreamId stid
+      | isEven stid = E.throwIO $ Break ProtocolError "Even stream identifier"
+      | otherwise   = return ()
 
 switch :: Context -> Frame -> IO Next
 switch Context{..} Frame{ framePayload = HeadersFrame _ hdrblk,
