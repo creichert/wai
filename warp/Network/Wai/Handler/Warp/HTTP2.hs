@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Network.Wai.Handler.Warp.HTTP2 (isHTTP2, http2) where
 
@@ -155,22 +156,23 @@ switch :: Context -> Frame -> IO Next
 switch Context{..} Frame{ framePayload = HeadersFrame _ hdrblk,
                           frameHeader = FrameHeader{..} } = do
     hdrtbl <- readIORef decodeDynamicTable
-    (hdrtbl', hdr) <- decodeHeader hdrtbl hdrblk
-    putStrLn "HeadersFrame"
-    print hdr
-    writeIORef decodeDynamicTable hdrtbl'
-    m0 <- readIORef idTable
-    let stid = fromStreamIdentifier streamId
-    case M.lookup stid m0 of
-        Just _  -> error "bad header frame" -- fixme
-        Nothing -> do
-            let end = testEndStream flags
-            inpQ <- newTQueueIO
-            unless end $ modifyIORef idTable $ \m -> M.insert stid inpQ m
-            -- fixme: need to testEndHeader. ContinuationFrame is not
-            -- support yet.
-            atomically $ writeTQueue inpQ (ReqHead hdr)
-            return $ Fork inpQ stid
+    ex <- E.try $ decodeHeader hdrtbl hdrblk
+    case ex of
+        Left (_ :: DecodeError) -> return $ CErr CompressionError
+        Right (hdrtbl', hdr) -> do
+            writeIORef decodeDynamicTable hdrtbl'
+            m0 <- readIORef idTable
+            let stid = fromStreamIdentifier streamId
+            case M.lookup stid m0 of
+                Just _  -> error "bad header frame" -- fixme
+                Nothing -> do
+                    let end = testEndStream flags
+                    inpQ <- newTQueueIO
+                    unless end $ modifyIORef idTable $ \m -> M.insert stid inpQ m
+                    -- fixme: need to testEndHeader. ContinuationFrame is not
+                    -- support yet.
+                    atomically $ writeTQueue inpQ (ReqHead hdr)
+                    return $ Fork inpQ stid
 
 switch Context{..} Frame{ framePayload = DataFrame body,
                           frameHeader = FrameHeader{..} } = do
