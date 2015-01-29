@@ -82,14 +82,15 @@ isHTTP2 tls = useHTTP2
 http2 :: Connection -> InternalInfo -> SockAddr -> Transport -> S.Settings -> Source -> Application -> IO ()
 http2 conn ii addr transport settings src app = do
     checkTLS
-    checkPreface
-    ctx <- newContext
-    let enqout = enqueueRsp ctx ii settings
-        mkreq = mkRequest settings addr
-    tid <- forkIO $ frameSender conn ii ctx
-    let rsp = RspFrame $ settingsFrame id []
-    atomically $ writeTQueue (outputQ ctx) rsp
-    frameReader ctx mkreq enqout src app `E.finally` killThread tid
+    ok <- checkPreface
+    when ok $ do
+        ctx <- newContext
+        let enqout = enqueueRsp ctx ii settings
+            mkreq = mkRequest settings addr
+        tid <- forkIO $ frameSender conn ii ctx
+        let rsp = RspFrame $ settingsFrame id []
+        atomically $ writeTQueue (outputQ ctx) rsp
+        frameReader conn ctx mkreq enqout src app `E.finally` killThread tid
   where
     checkTLS = case transport of
         TCP -> inadequateSecurity conn
@@ -97,10 +98,17 @@ http2 conn ii addr transport settings src app = do
     tls12orLater tls = tlsMajorVersion tls == 3 && tlsMinorVersion tls >= 3
     checkPreface = do
         bytes <- readSource src
-        when (BS.length bytes < connectionPrefaceLength) $ protocolError conn
-        let (preface, frames) = BS.splitAt connectionPrefaceLength bytes
-        when (connectionPreface /= preface) $ protocolError conn
-        leftoverSource src frames
+        if BS.length bytes < connectionPrefaceLength then do
+            protocolError conn
+            return False
+          else do
+            let (preface, frames) = BS.splitAt connectionPrefaceLength bytes
+            if connectionPreface /= preface then do
+                protocolError conn
+                return False
+              else do
+                leftoverSource src frames
+                return True
 
 ----------------------------------------------------------------
 
@@ -122,23 +130,25 @@ inadequateSecurity conn = goaway conn InadequateSecurity "Weak TLS"
 
 data Next = None | Done | Fork ReqQueue Int
 
-frameReader :: Context -> MkReq -> EnqRsp -> Source -> Application -> IO ()
-frameReader ctx mkreq enqout src app = do
-    bs <- readSource src
-    unless (BS.null bs) $ do
-        case decodeFrame defaultSettings bs of -- fixme
-            Left x            -> error (show x) -- fixme
-            Right (frame,bs') -> do
-                leftoverSource src bs'
-                print $ frameHeader frame
-                x <- switch ctx frame
-                case x of
-                    Done -> return ()
-                    None -> frameReader ctx mkreq enqout src app
-                    Fork inpQ stid -> do
-                        void . forkIO $ reqReader mkreq enqout inpQ stid app
-                        -- fixme: T.registerKillThread or pooling?
-                        frameReader ctx mkreq enqout src app
+frameReader :: Connection -> Context -> MkReq -> EnqRsp -> Source -> Application -> IO ()
+frameReader conn ctx mkreq enqout src app = loop
+  where
+    loop = do
+        bs <- readSource src
+        unless (BS.null bs) $ do
+            case decodeFrame defaultSettings bs of -- fixme
+                Left err          -> goaway conn err ""
+                Right (frame,bs') -> do
+                    leftoverSource src bs'
+                    print $ frameHeader frame
+                    x <- switch ctx frame
+                    case x of
+                        Done -> return ()
+                        None -> loop
+                        Fork inpQ stid -> do
+                            void . forkIO $ reqReader mkreq enqout inpQ stid app
+                            -- fixme: T.registerKillThread or pooling?
+                            loop
 
 switch :: Context -> Frame -> IO Next
 switch Context{..} Frame{ framePayload = HeadersFrame _ hdrblk,
